@@ -17,6 +17,7 @@
    [nrepl.transport :as t])
   (:import
    (java.net ServerSocket SocketException)
+   (javax.net.ssl SSLException)
    [java.nio.channels ClosedChannelException]))
 
 (defn handle*
@@ -51,27 +52,40 @@
 
 (defn- accept-connection
   [{:keys [server-socket open-transports transport greeting handler]
-    :as server}]
+    :as   server}
+   consume-exception]
   (when-let [sock (try
                     (socket/accept server-socket)
-                    (catch ClosedChannelException _
-                      nil))]
-    (noisy-future
-     (let [transport (transport sock)]
-       (try
-         (swap! open-transports conj transport)
-         (when greeting (greeting transport))
-         (handle handler transport)
-         (catch SocketException _
-           nil)
-         (finally
-           (swap! open-transports disj transport)
-           (safe-close transport)))))
-    (noisy-future
-     (try
-       (accept-connection server)
-       (catch SocketException _
-         nil)))))
+                    (catch SSLException ssl-exception
+                      (consume-exception ssl-exception)
+                      :recur)
+                    (catch ClosedChannelException cce
+                      (consume-exception cce)
+                      nil)
+                    (catch Throwable t
+                      (consume-exception t)
+                      (if (.isClosed ^ServerSocket server-socket)
+                        nil
+                        (throw t))))]
+    (if (= sock :recur)
+      (recur server consume-exception)
+      (do
+        (noisy-future
+          (let [transport (transport sock)]
+            (try
+              (swap! open-transports conj transport)
+              (when greeting (greeting transport))
+              (handle handler transport)
+              (catch SocketException _
+                nil)
+              (finally
+                (swap! open-transports disj transport)
+                (safe-close transport)))))
+        (noisy-future
+          (try
+            (accept-connection server consume-exception)
+            (catch SocketException _
+              nil)))))))
 
 (defn stop-server
   "Stops a server started via `start-server`."
@@ -176,7 +190,8 @@
    either via `stop-server`, (.close server), or automatically via `with-open`.
    The port that the server is open on is available in the :port slot of the
    server map (useful if the :port option is 0 or was left unspecified."
-  [& {:keys [port bind socket tls? tls-keys-str tls-keys-file transport-fn handler ack-port greeting-fn consume-exception]}]
+  [& {:keys [port bind socket tls? tls-keys-str tls-keys-file transport-fn handler ack-port greeting-fn consume-exception]
+      :or {consume-exception (fn [_] nil)}}]
   (when (and socket (or port bind tls?))
     (let [msg "Cannot listen on both port and filesystem socket"]
       (log msg)
@@ -197,23 +212,9 @@
                         (atom #{})
                         transport-fn
                         greeting-fn
-                        (or handler (default-handler)))
-        accept-connections (fn accept-connections []
-                             (noisy-future
-                              (try
-                                (accept-connection server)
-                                (catch Throwable t
-                                  (cond consume-exception
-                                        (do (consume-exception t)
-                                            (accept-connections))
-                                        (instance? SocketException t)
-                                        nil
-                                        :else
-                                        (throw t))))))]
-    (try
-      (accept-connections)
-      (catch SocketException _
-        nil))
+                        (or handler (default-handler)))]
+    (noisy-future
+      (accept-connection server consume-exception))
     (when ack-port
       (ack/send-ack (:port server) ack-port transport-fn))
     server))
